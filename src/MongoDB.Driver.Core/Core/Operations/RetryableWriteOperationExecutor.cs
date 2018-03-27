@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using MongoDB.Driver.Core.Bindings;
@@ -44,6 +45,7 @@ namespace MongoDB.Driver.Core.Operations
             Exception originalException;
             try
             {
+                System.Console.WriteLine(" ***** " + "Execute" +" ***** ");
                 return operation.ExecuteAttempt(context, 1, transactionNumber, cancellationToken);
             }
             catch (Exception ex) when (IsRetryableException(ex))
@@ -66,13 +68,49 @@ namespace MongoDB.Driver.Core.Operations
                 throw originalException;
             }
 
-            try
+           
+            var attempt = 2;
+            var retryExceptions = new List<Exception>();
+            retryExceptions.Add(originalException);
+            var maxRetries = (30 - (attempt-1));
+            var retryPauseSeconds = 1;
+            while (true)
             {
-                return operation.ExecuteAttempt(context, 2, transactionNumber, cancellationToken);
-            }
-            catch (Exception ex) when (ShouldThrowOriginalException(ex))
-            {
-                throw originalException;
+                try
+                {
+                    System.Console.WriteLine(" ***** About to retry, attempt = "+attempt+" ***** ");
+                    try
+                    {
+                        context.ReplaceChannelSource(context.Binding.GetWriteChannelSource(cancellationToken));
+                        context.ReplaceChannel(context.ChannelSource.GetChannel(cancellationToken));
+                    }
+                    catch (Exception exp) 
+                    {
+                        System.Console.WriteLine(" ***** Before retry channel replace failed. ***** ");
+                        System.Console.WriteLine(exp);
+                        retryExceptions.Add(exp);
+                        throw new AggregateException(retryExceptions);
+                    }
+                    var retryResult = operation.ExecuteAttempt(context, attempt, transactionNumber, cancellationToken);
+                    return retryResult;
+                }
+                catch (Exception ex) when (IsRetryableException(ex))
+                {
+                    retryExceptions.Add(ex);
+                    // add throttle logic
+                    System.Threading.Thread.Sleep(1000 * retryPauseSeconds);
+
+                }
+                catch (Exception ex) when (ShouldThrowOriginalException(ex))
+                {
+                    retryExceptions.Add(ex);
+                    throw new AggregateException(retryExceptions);
+                }
+                attempt = attempt + 1;
+                if (attempt >= maxRetries) {
+                    retryExceptions.Add(new Exception("Reached max retry attempts of " + maxRetries));
+                    throw new AggregateException(retryExceptions);
+                }
             }
         }
 
@@ -130,6 +168,9 @@ namespace MongoDB.Driver.Core.Operations
         // privates static methods
         private static bool AreRetryableWritesSupported(ConnectionDescription connectionDescription)
         {
+            var result = connectionDescription.IsMasterResult.LogicalSessionTimeout != null &&
+                connectionDescription.IsMasterResult.ServerType != ServerType.Standalone;
+            System.Console.WriteLine(" ****** AreRetryableWritesSupported result=" + result + " ****** ");
             return
                 connectionDescription.IsMasterResult.LogicalSessionTimeout != null &&
                 connectionDescription.IsMasterResult.ServerType != ServerType.Standalone;
@@ -137,15 +178,49 @@ namespace MongoDB.Driver.Core.Operations
 
         private static bool IsRetryableException(Exception ex)
         {
+            var retryableError = false;
+            if (ex is MongoCommandException) {
+                retryableError = IsRetryableExceptionErrorCode((MongoCommandException)ex);
+                System.Console.WriteLine("***** retryableError=" + retryableError + " *****");
+            }
             return
                 ex is MongoConnectionException ||
                 ex is MongoNotPrimaryException ||
-                ex is MongoNodeIsRecoveringException;
+                ex is MongoNodeIsRecoveringException ||
+                retryableError;
         }
 
+        private static Dictionary<int, string> retryableErrorCodes =
+            new Dictionary<int, string>() {
+
+            { 11600, "InterruptedAtShutdown"}
+            ,{ 11602, "InterruptedDueToReplStateChange" }
+            ,{ 10107, "NotMaster" }
+            ,{ 13435, "NotMasterNoSlaveOk" }
+            ,{ 13436, "NotMasterOrSecondary" }
+            ,{ 189, "PrimarySteppedDown" }
+            ,{ 91, "ShutdownInProgress" }
+            ,{ 64, "WriteConcernFailed" }
+            ,{ 7, "HostNotFound" }
+            ,{ 6, "HostUnreachable" }
+            ,{ 89, "NetworkTimeout" }
+            ,{ 9001, "SocketException" }
+        };
+
+
+        private static bool IsRetryableExceptionErrorCode(MongoCommandException ex) 
+        {
+            // not sure how to log here....
+            System.Console.WriteLine(" ***** IsRetryableExceptionErrorCode Code=" + ex.Code + " *****");
+            return retryableErrorCodes.ContainsKey(ex.Code);
+            
+        }
         private static bool ShouldThrowOriginalException(Exception retryException)
         {
-            return retryException is MongoException && !(retryException is MongoConnectionException);
+            var ret = retryException is MongoException && !(retryException is MongoConnectionException);
+            System.Console.WriteLine(" ***** ShouldThrowOriginalException return:" + ret);
+            //return retryException is MongoException && !(retryException is MongoConnectionException);
+            return ret;
         }
     }
 }
